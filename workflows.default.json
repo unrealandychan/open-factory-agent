@@ -1,0 +1,138 @@
+{
+  "workflows": [
+    {
+      "id": "factory-1785313400641",
+      "name": "新聞收集員（阿明）",
+      "status": "ready",
+      "steps": [
+        {
+          "id": "ai-bestblogs-rss-1785313551616-1",
+          "title": "抓取 BestBlogs RSS",
+          "desc": "本機腳本直接抓取並解析 BestBlogs RSS，輸出可供下一步使用的 JSON（零 Token）",
+          "type": "script",
+          "fields": [
+            {
+              "id": "rss_source",
+              "label": "RSS 來源（選填）",
+              "type": "text",
+              "placeholder": "留空則使用預設 RSS 來源",
+              "required": false
+            }
+          ],
+          "outputs": [
+            {
+              "label": "抓取結果",
+              "filename": "fetch_result.json",
+              "type": "JSON",
+              "path": "~/Desktop/OpenFactory/新聞收集員（阿明）/抓取 BestBlogs RSS"
+            }
+          ],
+          "outputPath": "~/Desktop/OpenFactory/新聞收集員（阿明）/抓取 BestBlogs RSS",
+          "dependsOn": [],
+          "actions": [
+            {
+              "type": "run_script",
+              "label": "執行本機腳本"
+            }
+          ],
+          "script": "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\"\"\"抓取 BestBlogs RSS → fetch_result.json（純標準函式庫，無第三方依賴）。\n\n相容 RSS 2.0 <item> 與 Atom <entry>。依 URL 去重、按 published_at 新到舊排序。\n失敗時仍寫入 status:\"error\" 的 JSON。\n用法：python3 fetch_bestblogs_rss.py [--source URL] [--out PATH]\n\"\"\"\nimport argparse\nimport json\nimport os\nimport subprocess\nimport sys\nimport urllib.request\nimport xml.etree.ElementTree as ET\nfrom datetime import datetime, timezone\n\nRSS_URL = \"https://www.bestblogs.dev/zh/feeds/rss\"\n\nUA = \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36\"\n\n\ndef download(url: str, out_path: str) -> bytes:\n    \"\"\"先用 urllib，失敗（SSL/RST 已知問題）時 fallback 到 curl -L。\"\"\"\n    try:\n        req = urllib.request.Request(url, headers={\"User-Agent\": UA, \"Accept\": \"*/*\"})\n        with urllib.request.urlopen(req, timeout=40) as resp:\n            return resp.read()\n    except Exception as e:\n        sys.stderr.write(f\"[warn] urllib 失敗 ({e.__class__.__name__}: {e})，改用 curl -L\\n\")\n        tmp = out_path + \".rss.tmp\"\n        r = subprocess.run(\n            [\"curl\", \"-sS\", \"-L\", \"--max-time\", \"60\",\n             \"-H\", f\"User-Agent: {UA}\", \"-o\", tmp, url],\n            capture_output=True, text=True)\n        if r.returncode != 0:\n            raise RuntimeError(f\"curl 失敗 rc={r.returncode}: {r.stderr}\")\n        with open(tmp, \"rb\") as f:\n            data = f.read()\n        os.remove(tmp)\n        return data\n\n\ndef parse_datetime(value):\n    \"\"\"解析多種日期格式；失敗回傳 None（不可捏造）。\"\"\"\n    if not value:\n        return None\n    value = value.strip()\n    fmts = [\n        \"%a, %d %b %Y %H:%M:%S %z\",   # RFC 822 (GMT)\n        \"%a, %d %b %Y %H:%M:%S %Z\",\n        \"%Y-%m-%dT%H:%M:%S%z\",        # ISO 8601\n        \"%Y-%m-%dT%H:%M:%S.%f%z\",\n        \"%Y-%m-%dT%H:%M:%SZ\",\n        \"%Y-%m-%dT%H:%M:%S\",\n        \"%Y-%m-%d %H:%M:%S\",\n        \"%Y-%m-%d\",\n    ]\n    for f in fmts:\n        try:\n            dt = datetime.strptime(value, f)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=timezone.utc)\n            return dt.astimezone(timezone.utc).isoformat()\n        except ValueError:\n            continue\n    return None\n\n\ndef text_of(el, tag):\n    \"\"\"取直接子元素文字；RSS 命名空間寬容處理。\"\"\"\n    if el is None:\n        return None\n    for child in el:\n        if child.tag.split(\"}\")[-1] == tag:\n            return (child.text or \"\").strip() or None\n    return None\n\n\ndef parse_feed(data: bytes):\n    root = ET.fromstring(data)\n    root_tag = root.tag.split(\"}\")[-1].lower()\n    articles = []\n\n    if root_tag == \"rss\":  # RSS 2.0\n        for item in root.iter():\n            if item.tag.split(\"}\")[-1] != \"item\":\n                continue\n            title = text_of(item, \"title\")\n            link = text_of(item, \"link\")\n            pub = text_of(item, \"pubDate\") or text_of(item, \"dc:date\")\n            desc = text_of(item, \"description\")\n            source = None\n            src_el = None\n            for child in item:\n                if child.tag.split(\"}\")[-1] == \"source\":\n                    src_el = child\n                    break\n            if src_el is not None:\n                source = (src_el.text or \"\").strip() or src_el.get(\"url\")\n            articles.append({\n                \"title\": title, \"url\": link,\n                \"published_at\": parse_datetime(pub),\n                \"summary\": desc, \"source\": source,\n            })\n    elif root_tag == \"feed\":  # Atom\n        for entry in root.iter():\n            if entry.tag.split(\"}\")[-1] != \"entry\":\n                continue\n            title = None\n            for child in entry:\n                if child.tag.split(\"}\")[-1] == \"title\":\n                    title = (child.text or \"\").strip() or None\n                    break\n            link = None\n            for child in entry:\n                if child.tag.split(\"}\")[-1] == \"link\":\n                    href = child.get(\"href\")\n                    rel = child.get(\"rel\", \"alternate\")\n                    if href and rel == \"alternate\":\n                        link = href\n                        break\n            published = text_of(entry, \"published\") or text_of(entry, \"updated\")\n            summary = text_of(entry, \"summary\") or text_of(entry, \"content\")\n            source = None\n            for child in entry:\n                if child.tag.split(\"}\")[-1] == \"source\":\n                    t = None\n                    for c in child:\n                        if c.tag.split(\"}\")[-1] == \"title\":\n                            t = (c.text or \"\").strip() or None\n                            break\n                    source = t\n                    break\n            articles.append({\n                \"title\": title, \"url\": link,\n                \"published_at\": parse_datetime(published),\n                \"summary\": summary, \"source\": source,\n            })\n\n    # 依 URL 去重（保留第一個；URL 為 None 的以 title 近似去重）\n    seen = set()\n    deduped = []\n    for a in articles:\n        key = a[\"url\"] or a[\"title\"]\n        if not key or key in seen:\n            continue\n        seen.add(key)\n        deduped.append(a)\n\n    # 依 published_at 新→舊排序；無時間的排最後\n    def sort_key(a):\n        return a[\"published_at\"] or \"0000-01-01T00:00:00+00:00\"\n    deduped.sort(key=sort_key, reverse=True)\n    return deduped\n\n\ndef main():\n    ap = argparse.ArgumentParser(description=\"抓取 BestBlogs RSS 並輸出 JSON\")\n    ap.add_argument(\"--source\", default=RSS_URL, help=\"RSS 來源 URL（預設 BestBlogs）\")\n    ap.add_argument(\"--out\", default=\"\", help=\"輸出 JSON 路徑（預設由 ${OUT} 提供）\")\n    args = ap.parse_args()\n\n    out_path = args.out or os.path.join(\"${OUT}\", \"fetch_result.json\")\n    if out_path.startswith(\"${\"):  # ${OUT} 未被系統替換（手動執行時）→ 退回兜底路徑\n        out_path = os.path.expanduser(\"~/Desktop/OpenFactory/新聞收集工廠/抓取 BestBlogs RSS/fetch_result.json\")\n        sys.stderr.write(\"[warn] 輸出目錄佔位符未被系統替換，使用兜底路徑: \" + out_path + \"\\n\")\n    rss_url = args.source or RSS_URL\n    try:\n        data = download(rss_url, out_path)\n        articles = parse_feed(data)\n        result = {\n            \"status\": \"success\",\n            \"rss_source\": rss_url,\n            \"fetched_at\": datetime.now(timezone.utc).isoformat(),\n            \"article_count\": len(articles),\n            \"articles\": articles,\n        }\n    except Exception as e:\n        sys.stderr.write(f\"[error] {e.__class__.__name__}: {e}\\n\")\n        result = {\n            \"status\": \"error\",\n            \"rss_source\": rss_url,\n            \"fetched_at\": datetime.now(timezone.utc).isoformat(),\n            \"article_count\": 0,\n            \"articles\": [],\n            \"error\": f\"{e.__class__.__name__}: {e}\",\n        }\n\n    os.makedirs(os.path.dirname(out_path), exist_ok=True)\n    with open(out_path, \"w\", encoding=\"utf-8\") as f:\n        json.dump(result, f, ensure_ascii=False, indent=2)\n\n    # 驗證\n    with open(out_path, \"r\", encoding=\"utf-8\") as f:\n        check = json.load(f)\n    assert check[\"article_count\"] == len(check[\"articles\"]), \"article_count 與 articles 長度不符\"\n    for a in check[\"articles\"]:\n        assert a.get(\"title\") and a.get(\"url\"), \"存在 title 或 url 為空\"\n    print(json.dumps({\n        \"status\": check[\"status\"],\n        \"rss_source\": check[\"rss_source\"],\n        \"fetched_at\": check[\"fetched_at\"],\n        \"article_count\": check[\"article_count\"],\n        \"error\": check.get(\"error\"),\n        \"output\": out_path,\n    }, ensure_ascii=False, indent=2))\n\n\nif __name__ == \"__main__\":\n    main()",
+          "order": 1
+        },
+        {
+          "id": "ai-md-1785313551616-2",
+          "title": "生成新聞內容 MD",
+          "desc": "本機腳本讀取步驟一的 fetch_result.json，自動生成新聞摘要 MD 文檔（零 Token，不需 Agent）",
+          "type": "script",
+          "fields": [
+            {
+              "id": "md_title",
+              "label": "文檔標題",
+              "type": "text",
+              "placeholder": "例如：2026-08-05 科技新聞精選",
+              "required": false
+            },
+            {
+              "id": "article_count",
+              "label": "文章數量（選填，留空自動偵測實際篇數）",
+              "type": "number",
+              "placeholder": "留空則自動使用 fetch_result.json 實際篇數",
+              "required": false
+            }
+          ],
+          "outputs": [
+            {
+              "label": "新聞摘要 MD",
+              "filename": "news_digest.md",
+              "type": "Markdown",
+              "path": "~/Desktop/OpenFactory/新聞收集員（阿明）/生成新聞內容 MD"
+            }
+          ],
+          "outputPath": "~/Desktop/OpenFactory/新聞收集員（阿明）/生成新聞內容 MD",
+          "dependsOn": [],
+          "actions": [
+            {
+              "type": "run_script",
+              "label": "執行本機腳本"
+            }
+          ],
+          "script": "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n'''生成新聞內容 MD（腳本模式）：讀取步驟一的 fetch_result.json，產生 news_digest.md。\n\n零 Token、純標準函式庫（無第三方依賴）。支援 {{md_title}} / {{article_count}} / ${OUT} 佔位符，\n執行時由 OpenFactory 自動替換。摘要優先取「一句話摘要」再補「詳細摘要」前幾句，湊 2-3 句。\n'''\nimport json\nimport os\nimport re\nimport sys\nfrom datetime import datetime, timezone\nfrom email.utils import parsedate_to_datetime\nfrom html.parser import HTMLParser\n\nSTEP1_PATHS = [\n    '~/Desktop/OpenFactory/新聞收集員（阿明）/抓取 BestBlogs RSS/fetch_result.json',\n    '/Users/gl/.openfactory/data/outputs/新聞收集工廠/抓取 BestBlogs RSS/fetch_result.json',\n]\n\nOUT_DIR = '${OUT}'          # 執行時由系統替換為本步驟輸出目錄\nOUT_FILENAME = 'news_digest.md'\n\nLABELS = [\n    ('📌', 'brief', '一句话摘要'),\n    ('📝', 'detail', '详细摘要'),\n    ('💡', 'points', '主要观点'),\n    ('💬', 'quotes', '文章金句'),\n    ('📊', 'info', '文章信息'),\n]\n\n\nclass _TextExtractor(HTMLParser):\n    '''HTML → 純文字：區塊標籤換行，script/style 內容丟棄。'''\n    BLOCK_TAGS = {'div', 'p', 'h1', 'h2', 'h3', 'h4', 'li', 'br', 'tr', 'ol', 'ul', 'section', 'blockquote'}\n\n    def __init__(self):\n        super().__init__()\n        self.parts = []\n        self._skip = 0\n\n    def handle_starttag(self, tag, attrs):\n        t = tag.lower()\n        if t in self.BLOCK_TAGS:\n            self.parts.append('\\n')\n        if t in ('script', 'style'):\n            self._skip += 1\n\n    def handle_endtag(self, tag):\n        t = tag.lower()\n        if t in self.BLOCK_TAGS:\n            self.parts.append('\\n')\n        if t in ('script', 'style') and self._skip > 0:\n            self._skip -= 1\n\n    def handle_data(self, data):\n        if self._skip == 0:\n            self.parts.append(data)\n\n\ndef strip_html(html_text):\n    p = _TextExtractor()\n    p.feed(html_text or '')\n    text = ''.join(p.parts)\n    text = re.sub(r'\\n\\s*\\n+', '\\n\\n', text)\n    text = re.sub(r'[ \\t]+', ' ', text)\n    return text.strip()\n\n\ndef clean(s):\n    return re.sub(r'\\s+', ' ', (s or '')).strip()\n\n\ndef extract_sections(summary_html):\n    '''按 emoji 區塊標題切段，回傳 {brief, detail, points, quotes, info}。'''\n    text = strip_html(summary_html)\n    parts = re.split(r'(?=📌|📝|💡|💬|📊)', text)\n    secs = {}\n    for part in parts:\n        part = part.strip()\n        if not part:\n            continue\n        for emoji, key, label in LABELS:\n            if part.startswith(emoji):\n                body = part[len(emoji):].lstrip()\n                body = re.sub(r'^' + re.escape(label) + r'\\s*', '', body)\n                secs[key] = clean(body)\n                break\n    return secs\n\n\ndef build_summary(secs, max_chars=420):\n    '''一句話摘要 1 句 + 詳細摘要前 2 句 = 2-3 句摘要。'''\n    sents = []\n    if secs.get('brief'):\n        sents.append(secs['brief'])\n    if secs.get('detail'):\n        for s in [x.strip() for x in re.split(r'(?<=[。！？!?])', secs['detail']) if x.strip()]:\n            if len(sents) >= 3:\n                break\n            if s not in sents:\n                sents.append(s)\n    if not sents:\n        sents = ['（無摘要）']\n    return ' '.join(sents)[:max_chars]\n\n\ndef parse_pub(value):\n    '''RFC822 / ISO8601 → 本地時區 datetime；失敗回傳 None。'''\n    if not value:\n        return None\n    try:\n        return parsedate_to_datetime(value).astimezone()\n    except Exception:\n        pass\n    try:\n        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).astimezone()\n    except Exception:\n        return None\n\n\ndef main():\n    md_title = '{{md_title}}' or '最新新聞'\n    user_count = '{{article_count}}'.strip()\n\n    src = None\n    for cand in STEP1_PATHS:\n        if os.path.isfile(cand):\n            src = cand\n            break\n    if not src:\n        print(json.dumps({'status': 'error', 'error': '找不到步驟一輸出 fetch_result.json', 'paths': STEP1_PATHS},\n                         ensure_ascii=False, indent=2))\n        sys.exit(1)\n\n    with open(src, encoding='utf-8') as f:\n        data = json.load(f)\n    if data.get('status') != 'success' or not isinstance(data.get('articles'), list):\n        print(json.dumps({'status': 'error', 'error': 'fetch_result.json 內容異常', 'detail': data.get('error')},\n                         ensure_ascii=False, indent=2))\n        sys.exit(1)\n\n    articles = data['articles']\n    rows = []\n    missing_url = []\n    missing_date = []\n    for a in articles:\n        title = clean(a.get('title'))\n        url = (a.get('url') or '').strip()\n        dt = parse_pub(a.get('published_at'))\n        secs = extract_sections(a.get('summary'))\n        abstract = build_summary(secs)\n        if not url:\n            missing_url.append(title)\n            continue\n        if dt is None:\n            missing_date.append(title)\n        rows.append({'title': title, 'url': url, 'dt': dt, 'pub': (dt.strftime('%Y-%m-%d %H:%M') if dt else ''), 'abstract': abstract})\n\n    # 新 → 舊排序；無時間的排最後\n    rows.sort(key=lambda r: r['dt'] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)\n\n    total = len(articles)\n    header_count = user_count if user_count.isdigit() else str(total)\n    fetch_time = str(data.get('fetched_at') or '')[:16].replace('T', ' ')\n    lines = ['# ' + md_title, '']\n    lines.append('> 來源：BestBlogs.dev RSS 精選 ｜ 共 ' + header_count + ' 篇 ｜ 資料抓取時間：' + fetch_time)\n    lines.append('')\n    for i, r in enumerate(rows, 1):\n        lines.append('## ' + str(i) + '. ' + r['title'])\n        lines.append('')\n        lines.append('- **發布日期**：' + r['pub'])\n        lines.append('- **來源連結**：[' + r['url'] + '](' + r['url'] + ')')\n        lines.append('- **摘要**：' + r['abstract'])\n        lines.append('')\n    md = '\\n'.join(lines)\n\n    os.makedirs(OUT_DIR, exist_ok=True)\n    out_path = os.path.join(OUT_DIR, OUT_FILENAME)\n    with open(out_path, 'w', encoding='utf-8') as f:\n        f.write(md)\n\n    # 驗證：重新讀回，確認標題、篇數、每篇都有 URL 與可點擊連結\n    with open(out_path, encoding='utf-8') as f:\n        check = f.read()\n    assert check.startswith('# '), 'Markdown 缺少標題'\n    assert check.count('## ') == len(rows), 'Markdown 文章數與預期不符'\n    bad_links = [r['title'] for r in rows if not (r['url'].startswith('http://') or r['url'].startswith('https://'))]\n    assert not bad_links, '存在非法 URL: ' + str(bad_links)\n\n    print(json.dumps({\n        'status': 'success',\n        'source': src,\n        'output': out_path,\n        'title': md_title,\n        'total_articles': total,\n        'written': len(rows),\n        'dropped_no_url': len(missing_url),\n        'missing_date': len(missing_date),\n        'size_bytes': os.path.getsize(out_path),\n    }, ensure_ascii=False, indent=2))\n\n\nif __name__ == '__main__':\n    main()",
+          "order": 2
+        },
+        {
+          "id": "ai-threads-1785580805946-1",
+          "title": "評分排序並生成 Threads 繁體文",
+          "desc": "對步驟二的文章做互動性評分（總分 100，5 維度加權），依分數排序後取前 8 篇，每篇改寫為固定格式的繁體 Threads 貼文（反直覺鉤子＋核心內容＋大廠 vs 小公司對比＋品牌簽名檔）。",
+          "type": "prompt",
+          "fields": [
+            {
+              "id": "top_n",
+              "label": "入選篇數",
+              "type": "number",
+              "placeholder": "預設 8",
+              "required": false
+            },
+            {
+              "id": "char_limit",
+              "label": "段落字數上限（核心內容與對比各 ≤ N 字）",
+              "type": "number",
+              "placeholder": "預設 300",
+              "required": false
+            }
+          ],
+          "outputs": [
+            {
+              "label": "Threads 熱門貼文 MD",
+              "filename": "threads_top_posts.md",
+              "type": "Markdown",
+              "path": "~/Desktop/OpenFactory/新聞收集員（阿明）/評分排序並生成 Threads 繁體文"
+            },
+            {
+              "label": "Threads 熱門貼文 JSON",
+              "filename": "threads_top_posts.json",
+              "type": "JSON",
+              "path": "~/Desktop/OpenFactory/新聞收集員（阿明）/評分排序並生成 Threads 繁體文"
+            }
+          ],
+          "outputPath": "~/Desktop/OpenFactory/新聞收集員（阿明）/評分排序並生成 Threads 繁體文",
+          "dependsOn": [
+            "ai-md-1785313551616-2"
+          ],
+          "actions": [
+            {
+              "type": "copy_prompt",
+              "label": "复制任务给 Agent"
+            }
+          ],
+          "prompt": "請直接完成以下任務：\n\n1. 讀取步驟二輸出的 `news_digest.md`（優先路徑：`~/Desktop/OpenFactory/新聞收集員（阿明）/生成新聞內容 MD/news_digest.md`；若不存在再嘗試 `/Users/gl/.openfactory/data/outputs/新聞收集工廠/生成新聞內容 MD/news_digest.md`），解析出每篇文章的標題、URL、發布日期、摘要。若檔案缺失或損壞，回報錯誤並停止。\n\n2. 對每一篇文章依下列 5 個維度評分（每項 0-20，總分 0-100）：\n   - 主題熱度（0-20）：Threads 主流通話題（AI、科技、商業、財經、個人成長、健康、文化、生活實用）。冷門政策公告、官方聲明類、純地方新聞酌減。\n   - 觀點銳度（0-20）：是否帶立場、對比、反差或爭議觀點，會讓人想發表意見。純敘述、無觀點的酌減。\n   - 情緒觸發（0-20）：能否勾起驚訝、共鳴、好奇、憤怒、會心一笑。\n   - 實用性／故事性（0-20）：讀完能用、能轉述、會被朋友轉發。\n   - 短傳發力（0-20）：能否用一句話就引發討論或勾起點擊慾望。\n   計算總分（整數），並寫出 1 句評分理由（從 Threads 用戶角度，不是學術角度）。\n\n3. 依總分由高到低排序，選出前 {{top_n}} 篇（預設 8）。若某文章總分 < 40，寧可少選一篇也不要湊數，並在 MD 結尾標註「未入選：〈標題〉（總分 XX）」。\n\n4. 為每一篇入選文章，撰寫一篇 **繁體中文 Threads 貼文**，嚴格按照以下固定格式輸出（`=====` 為分隔線，每段各佔一行）：\n\n   [反直覺鉤子句]\n   =====\n   [核心內容段落 - ≤{{char_limit}} 字]\n   =====\n   [大廠 vs 小公司對比 - ≤{{char_limit}} 字]\n   =====\n   👋 大家好，這裡是 Open Factory Agent｜AI 自動化工廠\n\n   如果你也在觀察 AI Agent 和下一輪科技週期\n   記得幫我點個雙追 ➕\n\n   一起把系統搭好，讓錢自己跑。\n\n   📌 追蹤我：@open_factory_agent\n\n   各段規則：\n   - 反直覺鉤子句：一句話以內，直接拋出反直覺觀點或強烈情緒，不可用「這篇文章介紹…」這種廢話開頭。\n   - 核心內容段落：≤{{char_limit}} 字（標點符號也算），口語化、可直接唸出，濃縮該文章 2-3 個核心觀點或故事節點。\n   - 大廠 vs 小公司對比：≤{{char_limit}} 字（標點符號也算），結合該篇文章主題，寫出大廠與小公司（或個人）在資源、速度、成本、選擇權上的差異，凸顯「小公司也能用 AI 槓桿翻盤」的判斷力觀點；不可硬套，須與文章內容相關。\n   - 結尾品牌簽名檔為固定文字，一字不改（含 emoji 與換行）。\n   - 在簽名檔之後另起一行附上來源 URL（Markdown 連結格式：<URL>）。\n   - 不可用簡體字；技術名詞、品牌名稱可保留原文。\n   - 不可以「以上」、「總之」等湊字數結尾。\n\n5. 將結果寫入 `${OUT}/threads_top_posts.md`，UTF-8 編碼，結構為：\n   ```\n   # Threads 熱門貼文（YYYY-MM-DD）\n   > 來源：news_digest.md｜入選：前 {{top_n}} 篇｜評分時間：ISO 8601\n\n   ## 排名 1：〈標題〉（總分 XX）\n   - 來源：<URL>\n   - 發布：YYYY-MM-DD HH:MM UTC\n   - 評分理由：……\n   - 5 維分數：主題熱度 X / 觀點銳度 X / 情緒觸發 X / 實用性 X / 短傳發力 X\n\n   ### Threads 貼文\n   （依第 4 點固定格式的完整繁體文）\n\n   ## 排名 2：…\n\n   ---\n   ## 未入選\n   - 〈標題〉（總分 XX）— 理由\n   ```\n\n6. 同時寫入 `${OUT}/threads_top_posts.json`，`posts` 為陣列，每個元素含：`rank`、`title`、`url`、`published_at`、`score`、`reason`、`scores_breakdown`（物件）、`threads_body`（完整貼文，含分隔線與簽名檔）。\n\n7. 完成前驗證（用程式計算，不要目測）：\n   - threads_top_posts.md 存在、Markdown 合法。\n   - 入選篇數 ≤ {{top_n}}。\n   - 每篇 threads_body 恰好包含 3 條 `=====` 分隔線。\n   - 核心內容段落與大廠 vs 小公司對比段落各 ≤ {{char_limit}} 字。\n   - 每篇都含繁體中文字元（若全為簡體則視為失敗）。\n   - 簽名檔固定文字完整（含「👋 大家好，這裡是 Open Factory Agent｜AI 自動化工廠」與「📌 追蹤我：@open_factory_agent」）。\n   - 結尾 URL 與原始文章 URL 一致。\n\n8. 最後回報：實際入選篇數、第 1 名標題與總分、產出檔案絕對路徑（展開 `~`）。",
+          "order": 3
+        }
+      ],
+      "description": "定時收集各大新聞來源，整理成可供其他 Agent 使用的新聞資料與每日摘要。",
+      "employee_icon": "assistant_b",
+      "employee_name": "新聞收集員（阿明）",
+      "employee_description": "定時 RSS 新聞收集，可以幫助你和各個工廠獲取最新新聞。",
+      "employee_resume": "專業技能\n\n* 新聞網站 / RSS / API 資料收集\n* 關鍵字監控與熱點追蹤\n* 新聞摘要與內容分類\n* 多來源資訊交叉驗證\n* 每日新聞簡報生成\n\n擅長工具\n\n* Python\n* Playwright\n* BeautifulSoup\n* RSS\n* News API\n* Notion\n* Google Sheets\n* n8n",
+      "resume": "## 專業技能\n\n- 新聞網站、RSS 與 API 資料收集\n- 關鍵字監控與熱點事件追蹤\n- 新聞摘要與內容分類\n- 多來源資訊交叉驗證\n- 每日新聞簡報生成\n\n## 擅長工具\n\n- Python\n- Playwright\n- BeautifulSoup\n- RSS Feed\n- News API\n- Google Alerts\n- Notion\n- Google Sheets\n- n8n"
+    }
+  ]
+}

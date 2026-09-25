@@ -1,0 +1,21 @@
+services:
+  open-factory-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-factory-agent:latest
+    container_name: open-factory-agent
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OPENFACTORY_PORT=8765
+      - OPENFACTORY_DATA_DIR=/app/data
+      - AUTOMONEY_NO_BROWSER=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8765/api/config"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
